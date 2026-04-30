@@ -8,8 +8,9 @@
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="Slither" />
-<link rel="apple-touch-icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><defs><radialGradient id='g' cx='35%25' cy='35%25'><stop offset='0' stop-color='%23ffd24a'/><stop offset='1' stop-color='%23ff7eb3'/></radialGradient></defs><rect width='180' height='180' rx='40' fill='%2307091a'/><circle cx='90' cy='90' r='55' fill='url(%23g)'/><circle cx='75' cy='80' r='10' fill='white'/><circle cx='78' cy='82' r='5' fill='%230a0a0a'/></svg>" />
-<link rel="manifest" href='data:application/manifest+json,{"name":"Slither","short_name":"Slither","start_url":"./","display":"fullscreen","orientation":"any","background_color":"%2307091a","theme_color":"%2307091a","icons":[{"src":"data:image/svg+xml;utf8,<svg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 512 512%27><defs><radialGradient id=%27g%27 cx=%2735%25%27 cy=%2735%25%27><stop offset=%270%27 stop-color=%27%23ffd24a%27/><stop offset=%271%27 stop-color=%27%23ff7eb3%27/></radialGradient></defs><rect width=%27512%27 height=%27512%27 rx=%27115%27 fill=%27%2307091a%27/><circle cx=%27256%27 cy=%27256%27 r=%27155%27 fill=%27url(%23g)%27/><circle cx=%27215%27 cy=%27225%27 r=%2728%27 fill=%27white%27/><circle cx=%27223%27 cy=%27232%27 r=%2714%27 fill=%27%230a0a0a%27/></svg>","sizes":"512x512","type":"image/svg+xml"}]}' />
+<link rel="icon" href="icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="icon.svg" />
+<link rel="manifest" href="manifest.json" />
 <title>Slither — Snake.io</title>
 <style>
   :root {
@@ -387,6 +388,13 @@
 </div>
 
 <script>
+// Register service worker for PWA install + offline support
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  });
+}
+
 (() => {
   'use strict';
 
