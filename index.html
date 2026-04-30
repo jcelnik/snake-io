@@ -443,6 +443,55 @@
     ['#fcd34d', '#f59e0b', '#fef9c3']
   ];
 
+  // ============= SPATIAL HASH =============
+  // Rebuilt each frame; buckets snake segments and food by grid cell so we can
+  // query only nearby items instead of scanning everything.
+  const GRID_CELL = 80;
+  const segGrid = new Map();
+  const foodGrid = new Map();
+
+  function gridKey(x, y) {
+    const cx = Math.floor(x / GRID_CELL);
+    const cy = Math.floor(y / GRID_CELL);
+    return cx * 73856093 ^ cy * 19349663;
+  }
+
+  function rebuildSegmentGrid() {
+    segGrid.clear();
+    for (const s of snakes) {
+      if (!s.alive) continue;
+      // Sample every 2nd segment for collision (matches old behavior, halves cost)
+      for (let i = 0; i < s.segments.length; i += 2) {
+        const seg = s.segments[i];
+        const k = gridKey(seg.x, seg.y);
+        let bucket = segGrid.get(k);
+        if (!bucket) { bucket = []; segGrid.set(k, bucket); }
+        bucket.push({ snake: s, x: seg.x, y: seg.y, r: s.radius });
+      }
+    }
+  }
+
+  function rebuildFoodGrid() {
+    foodGrid.clear();
+    for (let i = 0; i < food.length; i++) {
+      const f = food[i];
+      const k = gridKey(f.x, f.y);
+      let bucket = foodGrid.get(k);
+      if (!bucket) { bucket = []; foodGrid.set(k, bucket); }
+      bucket.push(i);
+    }
+  }
+
+  function forEachNearbyCell(x, y, cb) {
+    const cx = Math.floor(x / GRID_CELL);
+    const cy = Math.floor(y / GRID_CELL);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const k = (cx + dx) * 73856093 ^ (cy + dy) * 19349663;
+        cb(k);
+      }
+    }
+  }
   function rand(min, max) { return min + Math.random() * (max - min); }
   function randInt(min, max) { return Math.floor(rand(min, max + 1)); }
   function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
@@ -617,13 +666,33 @@
     const eatRadius = s.radius + 14;
     const eatR2 = eatRadius * eatRadius;
 
-    for (let i = food.length - 1; i >= 0; i--) {
-      const f = food[i];
-      if (dist2(head.x, head.y, f.x, f.y) < eatR2) {
-        s.length += f.value;
-        s.score += f.value * 10;
-        food.splice(i, 1);
+    // Collect candidate food indices from nearby grid cells, then test
+    const toRemove = [];
+    forEachNearbyCell(head.x, head.y, (k) => {
+      const bucket = foodGrid.get(k);
+      if (!bucket) return;
+      for (const idx of bucket) {
+        const f = food[idx];
+        if (!f) continue;
+        if (dist2(head.x, head.y, f.x, f.y) < eatR2) {
+          toRemove.push(idx);
+        }
       }
+    });
+
+    if (toRemove.length === 0) return;
+
+    // Remove from highest index to lowest so splice doesn't shift later ones
+    toRemove.sort((a, b) => b - a);
+    let prev = -1;
+    for (const idx of toRemove) {
+      if (idx === prev) continue; // dedupe (same food shouldn't be in two cells, but be safe)
+      prev = idx;
+      const f = food[idx];
+      if (!f) continue;
+      s.length += f.value;
+      s.score += f.value * 10;
+      food.splice(idx, 1);
     }
   }
 
@@ -632,21 +701,22 @@
     const head = s.segments[0];
     const hr = s.radius;
 
-    for (const other of snakes) {
-      if (!other.alive || other === s) continue;
-      const segs = other.segments;
-      const otherR = other.radius;
-      const collideR = hr + otherR * 0.85;
-      const collideR2 = collideR * collideR;
-
-      for (let i = 0; i < segs.length; i += 2) {
-        const seg = segs[i];
-        if (dist2(head.x, head.y, seg.x, seg.y) < collideR2) {
-          killSnake(s);
+    let dead = false;
+    forEachNearbyCell(head.x, head.y, (k) => {
+      if (dead) return;
+      const bucket = segGrid.get(k);
+      if (!bucket) return;
+      for (const item of bucket) {
+        if (item.snake === s) continue;
+        const collideR = hr + item.r * 0.85;
+        if (dist2(head.x, head.y, item.x, item.y) < collideR * collideR) {
+          dead = true;
           return;
         }
       }
-    }
+    });
+
+    if (dead) killSnake(s);
   }
 
   function updateBotAI(s, dt) {
@@ -670,18 +740,19 @@
 
     let dangerAngle = null;
     let minDanger = Infinity;
-    for (const other of snakes) {
-      if (!other.alive || other === s) continue;
-      for (let i = 0; i < other.segments.length; i += 4) {
-        const seg = other.segments[i];
-        const d = dist2(ahead.x, ahead.y, seg.x, seg.y);
-        const threat = (other.radius + s.radius + 30);
+    forEachNearbyCell(ahead.x, ahead.y, (k) => {
+      const bucket = segGrid.get(k);
+      if (!bucket) return;
+      for (const item of bucket) {
+        if (item.snake === s) continue;
+        const d = dist2(ahead.x, ahead.y, item.x, item.y);
+        const threat = item.r + s.radius + 30;
         if (d < threat * threat && d < minDanger) {
           minDanger = d;
-          dangerAngle = Math.atan2(seg.y - head.y, seg.x - head.x);
+          dangerAngle = Math.atan2(item.y - head.y, item.x - head.x);
         }
       }
-    }
+    });
 
     if (dangerAngle != null) {
       s.targetAngle = dangerAngle + Math.PI + rand(-0.2, 0.2);
@@ -693,13 +764,22 @@
       s.aiTimer = rand(0.4, 1.2);
       let best = null;
       let bestScore = -Infinity;
-      const sampleStart = Math.floor(Math.random() * Math.max(1, food.length - 30));
-      const end = Math.min(food.length, sampleStart + 60);
-      for (let i = sampleStart; i < end; i++) {
-        const f = food[i];
-        const d = dist2(head.x, head.y, f.x, f.y);
-        const score = f.value * 100 - d * 0.001;
-        if (score > bestScore) { bestScore = score; best = f; }
+      // Search in a small ring of cells around the bot's head
+      const cx = Math.floor(head.x / GRID_CELL);
+      const cy = Math.floor(head.y / GRID_CELL);
+      for (let dx = -3; dx <= 3; dx++) {
+        for (let dy = -3; dy <= 3; dy++) {
+          const k = (cx + dx) * 73856093 ^ (cy + dy) * 19349663;
+          const bucket = foodGrid.get(k);
+          if (!bucket) continue;
+          for (const idx of bucket) {
+            const f = food[idx];
+            if (!f) continue;
+            const d = dist2(head.x, head.y, f.x, f.y);
+            const score = f.value * 100 - d * 0.001;
+            if (score > bestScore) { bestScore = score; best = f; }
+          }
+        }
       }
       s.aiTarget = best;
     }
@@ -908,21 +988,32 @@
   }
 
   function drawFood() {
-    for (const f of food) {
+    const minX = -30, maxX = viewW + 30, minY = -30, maxY = viewH + 30;
+    const t = frame * 0.06;
+
+    // Glow pass — single composite, simple alpha circles, no per-orb radial gradients
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < food.length; i++) {
+      const f = food[i];
       const s = worldToScreen(f.x, f.y);
-      if (s.x < -30 || s.x > viewW + 30 || s.y < -30 || s.y > viewH + 30) continue;
-
-      const pulse = 1 + Math.sin(f.pulse + frame * 0.06) * 0.15;
+      if (s.x < minX || s.x > maxX || s.y < minY || s.y > maxY) continue;
+      const pulse = 1 + Math.sin(f.pulse + t) * 0.15;
       const r = f.radius * camera.zoom * pulse;
-
+      ctx.fillStyle = f.color + '33';
       ctx.beginPath();
-      ctx.arc(s.x, s.y, r * 2.2, 0, TAU);
-      const grad = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r * 2.2);
-      grad.addColorStop(0, f.color + 'aa');
-      grad.addColorStop(0.4, f.color + '33');
-      grad.addColorStop(1, f.color + '00');
-      ctx.fillStyle = grad;
+      ctx.arc(s.x, s.y, r * 1.8, 0, TAU);
       ctx.fill();
+    }
+    ctx.restore();
+
+    // Core pass
+    for (let i = 0; i < food.length; i++) {
+      const f = food[i];
+      const s = worldToScreen(f.x, f.y);
+      if (s.x < minX || s.x > maxX || s.y < minY || s.y > maxY) continue;
+      const pulse = 1 + Math.sin(f.pulse + t) * 0.15;
+      const r = f.radius * camera.zoom * pulse;
 
       ctx.beginPath();
       ctx.arc(s.x, s.y, r, 0, TAU);
@@ -946,28 +1037,39 @@
     const c2 = s.palette[1];
     const c3 = s.palette[2];
 
+    // Camera-space cull bounds (precomputed once per snake)
+    const minX = -50, maxX = viewW + 50, minY = -50, maxY = viewH + 50;
+
+    // Boost trail: a single additive glow stroke is much cheaper than per-segment radial gradients
     if (s.boosting) {
       ctx.save();
       ctx.globalCompositeOperation = 'lighter';
-      for (let i = segs.length - 1; i >= 0; i -= 3) {
-        const seg = segs[i];
-        const sc = worldToScreen(seg.x, seg.y);
-        if (sc.x < -50 || sc.x > viewW + 50 || sc.y < -50 || sc.y > viewH + 50) continue;
-        ctx.beginPath();
-        ctx.arc(sc.x, sc.y, r * 1.8, 0, TAU);
-        const g = ctx.createRadialGradient(sc.x, sc.y, 0, sc.x, sc.y, r * 1.8);
-        g.addColorStop(0, c1 + '66');
-        g.addColorStop(1, c1 + '00');
-        ctx.fillStyle = g;
-        ctx.fill();
+      ctx.strokeStyle = c1 + '55';
+      ctx.lineWidth = r * 3.2;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < segs.length; i += 4) {
+        const sc = worldToScreen(segs[i].x, segs[i].y);
+        if (sc.x < minX || sc.x > maxX || sc.y < minY || sc.y > maxY) {
+          started = false;
+          continue;
+        }
+        if (!started) { ctx.moveTo(sc.x, sc.y); started = true; }
+        else ctx.lineTo(sc.x, sc.y);
       }
+      ctx.stroke();
       ctx.restore();
     }
 
-    for (let i = segs.length - 1; i >= 0; i--) {
+    // Body: stride by 2 (visually identical because circles overlap heavily) and skip off-screen.
+    // Tail-to-head order so head sits on top.
+    const stride = r < 6 ? 3 : 2;
+    for (let i = segs.length - 1; i >= 0; i -= stride) {
       const seg = segs[i];
       const sc = worldToScreen(seg.x, seg.y);
-      if (sc.x < -50 || sc.x > viewW + 50 || sc.y < -50 || sc.y > viewH + 50) continue;
+      if (sc.x < minX || sc.x > maxX || sc.y < minY || sc.y > maxY) continue;
 
       ctx.beginPath();
       ctx.arc(sc.x, sc.y, r, 0, TAU);
@@ -981,8 +1083,11 @@
       ctx.fill();
     }
 
+    // Head detail
     const head = segs[0];
     const hs = worldToScreen(head.x, head.y);
+    if (hs.x < minX || hs.x > maxX || hs.y < minY || hs.y > maxY) return;
+
     const eyeOffset = r * 0.45;
     const eyeR = r * 0.28;
     const angle = s.angle;
@@ -1054,13 +1159,19 @@
       player.boosting = input.boost && player.length > 6;
     }
 
+    // AI runs first, but it queries grids built last frame — that's fine, one-frame lag is invisible
     for (const s of snakes) {
       if (!s.isPlayer) updateBotAI(s, dt);
     }
 
     for (const s of snakes) updateSnake(s, dt);
 
+    // Rebuild grids now that everything has moved
+    rebuildSegmentGrid();
+    rebuildFoodGrid();
+
     for (const s of snakes) checkFoodCollisions(s);
+    // Food was eaten; rebuild food grid is unnecessary because next collision pass doesn't use it
     for (const s of snakes) checkSnakeCollisions(s);
 
     while (food.length < FOOD_COUNT) food.push(spawnFoodInWorld());
