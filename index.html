@@ -574,10 +574,18 @@
     const y = Math.sin(angle) * r;
     const heading = Math.atan2(-y, -x) + rand(-1, 1);
     const len = randInt(8, 30);
-    return makeSnake({
+    const bot = makeSnake({
       x, y, angle: heading, length: len,
       name: pick(BOT_NAMES) + (Math.random() < 0.4 ? randInt(1, 99) : '')
     });
+    // Personality: independent traits that bias decisions
+    bot.aggression = rand(0.1, 0.95);   // willingness to chase / cut off
+    bot.greed      = rand(0.4, 1.0);    // weight on food value vs. safety
+    bot.caution    = rand(0.3, 0.9);    // how much margin to keep
+    bot.boostiness = rand(0.0, 0.6);    // tendency to boost
+    bot.target = null;                  // either {kind:'food', f} or {kind:'snake', s}
+    bot.targetTimer = 0;
+    return bot;
   }
 
   function initSnakes() {
@@ -719,78 +727,228 @@
     if (dead) killSnake(s);
   }
 
+  // Returns the distance along a ray (cast from `head` in direction `angle`) at
+  // which the ray would hit a non-self segment, or maxDist if clear. Also factors
+  // in the world boundary so bots don't run into the wall.
+  function rayDangerDistance(s, angle, maxDist) {
+    const head = s.segments[0];
+    const dirX = Math.cos(angle);
+    const dirY = Math.sin(angle);
+    const radius = s.radius;
+
+    // Wall check: distance from head along ray to circular boundary
+    // |head + t*dir| = WORLD_RADIUS  =>  solve quadratic
+    const dotHD = head.x * dirX + head.y * dirY;
+    const headLen2 = head.x * head.x + head.y * head.y;
+    const wallDisc = dotHD * dotHD - (headLen2 - WORLD_RADIUS * WORLD_RADIUS);
+    let wallDist = maxDist;
+    if (wallDisc >= 0) {
+      const tWall = -dotHD + Math.sqrt(wallDisc);
+      if (tWall > 0 && tWall < wallDist) wallDist = tWall;
+    }
+
+    // Sample along the ray, querying the segment grid at intervals
+    const step = GRID_CELL;
+    let segDist = maxDist;
+    for (let t = step * 0.5; t < maxDist; t += step) {
+      const px = head.x + dirX * t;
+      const py = head.y + dirY * t;
+      let hit = false;
+      forEachNearbyCell(px, py, (k) => {
+        if (hit) return;
+        const bucket = segGrid.get(k);
+        if (!bucket) return;
+        for (const item of bucket) {
+          if (item.snake === s) continue;
+          // Perpendicular distance from ray to segment center
+          const dx = item.x - head.x;
+          const dy = item.y - head.y;
+          const along = dx * dirX + dy * dirY;
+          if (along < 0 || along > t + step) continue;
+          const perp2 = (dx * dx + dy * dy) - along * along;
+          const reach = item.r + radius + 4;
+          if (perp2 < reach * reach) {
+            const hitT = along - Math.sqrt(Math.max(0, reach * reach - perp2));
+            if (hitT < segDist) segDist = hitT;
+            hit = true;
+            return;
+          }
+        }
+      });
+      if (hit) break;
+    }
+
+    return Math.min(wallDist, segDist);
+  }
+
+  // Pick a target food, weighting value against distance. Returns {f, score} or null.
+  function findBestFood(s) {
+    const head = s.segments[0];
+    let best = null, bestScore = -Infinity;
+    const cx = Math.floor(head.x / GRID_CELL);
+    const cy = Math.floor(head.y / GRID_CELL);
+    const range = 4;
+    for (let dx = -range; dx <= range; dx++) {
+      for (let dy = -range; dy <= range; dy++) {
+        const k = (cx + dx) * 73856093 ^ (cy + dy) * 19349663;
+        const bucket = foodGrid.get(k);
+        if (!bucket) continue;
+        for (const idx of bucket) {
+          const f = food[idx];
+          if (!f) continue;
+          const d2 = dist2(head.x, head.y, f.x, f.y);
+          // Prefer high-value food (corpse drops) and closer food. Greed amplifies value weight.
+          const score = (f.value * 80 * s.greed) - d2 * 0.0008;
+          if (score > bestScore) { bestScore = score; best = f; }
+        }
+      }
+    }
+    return best ? { f: best, score: bestScore } : null;
+  }
+
+  // Look for a smaller snake whose head we can intercept.
+  function findInterceptTarget(s) {
+    const head = s.segments[0];
+    let best = null, bestScore = -Infinity;
+    for (const other of snakes) {
+      if (!other.alive || other === s) continue;
+      // Only hunt smaller snakes — head-on with bigger ones is suicide
+      if (other.length > s.length * 0.85) continue;
+
+      const oHead = other.segments[0];
+      const dx = oHead.x - head.x;
+      const dy = oHead.y - head.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > 350 * 350) continue; // out of effective range
+
+      // Intercept point: where will their head be by the time we get there?
+      const d = Math.sqrt(d2);
+      const t = d / Math.max(0.5, s.baseSpeed * 1.4);
+      const ix = oHead.x + Math.cos(other.angle) * other.baseSpeed * t;
+      const iy = oHead.y + Math.sin(other.angle) * other.baseSpeed * t;
+
+      // Score: closer + smaller is better, weighted by aggression
+      const sizeRatio = (s.length - other.length) / s.length;
+      const score = (sizeRatio * 200 * s.aggression) - d * 0.5;
+      if (score > bestScore) {
+        bestScore = score;
+        best = { x: ix, y: iy, snake: other };
+      }
+    }
+    return best;
+  }
+
   function updateBotAI(s, dt) {
     if (!s.alive || s.isPlayer) return;
 
     s.aiTimer -= dt;
+    s.targetTimer -= dt;
     const head = s.segments[0];
     const distFromCenter = Math.hypot(head.x, head.y);
 
-    if (distFromCenter > WORLD_RADIUS * 0.85) {
-      s.targetAngle = Math.atan2(-head.y, -head.x) + rand(-0.3, 0.3);
-      s.boosting = distFromCenter > WORLD_RADIUS * 0.95 && s.length > 10;
-      return;
-    }
-
-    const lookAhead = 80 + (s.boosting ? 60 : 0);
-    const ahead = {
-      x: head.x + Math.cos(s.angle) * lookAhead,
-      y: head.y + Math.sin(s.angle) * lookAhead
-    };
-
-    let dangerAngle = null;
-    let minDanger = Infinity;
-    forEachNearbyCell(ahead.x, ahead.y, (k) => {
-      const bucket = segGrid.get(k);
-      if (!bucket) return;
-      for (const item of bucket) {
-        if (item.snake === s) continue;
-        const d = dist2(ahead.x, ahead.y, item.x, item.y);
-        const threat = item.r + s.radius + 30;
-        if (d < threat * threat && d < minDanger) {
-          minDanger = d;
-          dangerAngle = Math.atan2(item.y - head.y, item.x - head.x);
-        }
-      }
-    });
-
-    if (dangerAngle != null) {
-      s.targetAngle = dangerAngle + Math.PI + rand(-0.2, 0.2);
+    // ====== Wall handling: start turning early, parallel to boundary ======
+    const wallMargin = 250 + s.caution * 150;
+    const distToWall = WORLD_RADIUS - distFromCenter;
+    if (distToWall < wallMargin) {
+      // Direction tangent to the boundary; pick whichever side is closer to current heading
+      const inwardAngle = Math.atan2(-head.y, -head.x);
+      const tangentA = inwardAngle + Math.PI / 2;
+      const tangentB = inwardAngle - Math.PI / 2;
+      const blend = clamp(distToWall / wallMargin, 0, 1); // 1 = far, 0 = touching
+      const tangent = Math.abs(angleDiff(s.angle, tangentA)) < Math.abs(angleDiff(s.angle, tangentB))
+        ? tangentA : tangentB;
+      // Blend between full inward (close to wall) and tangent (far from wall)
+      const target = blend > 0.5
+        ? tangent
+        : inwardAngle + angleDiff(inwardAngle, tangent) * blend * 2;
+      s.targetAngle = target;
       s.boosting = false;
       return;
     }
 
-    if (s.aiTimer <= 0 || !s.aiTarget) {
-      s.aiTimer = rand(0.4, 1.2);
-      let best = null;
-      let bestScore = -Infinity;
-      // Search in a small ring of cells around the bot's head
-      const cx = Math.floor(head.x / GRID_CELL);
-      const cy = Math.floor(head.y / GRID_CELL);
-      for (let dx = -3; dx <= 3; dx++) {
-        for (let dy = -3; dy <= 3; dy++) {
-          const k = (cx + dx) * 73856093 ^ (cy + dy) * 19349663;
-          const bucket = foodGrid.get(k);
-          if (!bucket) continue;
-          for (const idx of bucket) {
-            const f = food[idx];
-            if (!f) continue;
-            const d = dist2(head.x, head.y, f.x, f.y);
-            const score = f.value * 100 - d * 0.001;
-            if (score > bestScore) { bestScore = score; best = f; }
-          }
-        }
+    // ====== Decide what we want to do (refresh target periodically) ======
+    if (s.targetTimer <= 0 || !s.target) {
+      s.targetTimer = rand(0.5, 1.4);
+
+      const foodPick = findBestFood(s);
+      const intercept = s.length > 15 && Math.random() < s.aggression * 0.7
+        ? findInterceptTarget(s) : null;
+
+      // Compare scores. Intercepts get a hefty bonus when we're significantly larger.
+      const interceptScore = intercept
+        ? 200 + (s.length / Math.max(1, intercept.snake.length)) * 50 * s.aggression
+        : -Infinity;
+      const foodScore = foodPick ? foodPick.score : -Infinity;
+
+      if (interceptScore > foodScore && intercept) {
+        s.target = { kind: 'snake', x: intercept.x, y: intercept.y, snake: intercept.snake };
+      } else if (foodPick) {
+        s.target = { kind: 'food', x: foodPick.f.x, y: foodPick.f.y, f: foodPick.f };
+      } else {
+        s.target = null;
       }
-      s.aiTarget = best;
     }
 
-    if (s.aiTarget) {
-      s.targetAngle = Math.atan2(s.aiTarget.y - head.y, s.aiTarget.x - head.x);
-    } else if (s.aiTimer <= 0) {
-      s.targetAngle = s.angle + rand(-0.8, 0.8);
+    // Refresh moving target each tick
+    if (s.target && s.target.kind === 'snake' && s.target.snake.alive) {
+      const oHead = s.target.snake.segments[0];
+      const dx = oHead.x - head.x;
+      const dy = oHead.y - head.y;
+      const d = Math.hypot(dx, dy);
+      const t = d / Math.max(0.5, s.baseSpeed * 1.4);
+      s.target.x = oHead.x + Math.cos(s.target.snake.angle) * s.target.snake.baseSpeed * t;
+      s.target.y = oHead.y + Math.sin(s.target.snake.angle) * s.target.snake.baseSpeed * t;
+    } else if (s.target && s.target.kind === 'snake' && !s.target.snake.alive) {
+      s.target = null;
     }
 
-    s.boosting = (s.length > 20 && Math.random() < 0.005);
+    // ====== Cast feelers and pick the best heading ======
+    const desiredAngle = s.target
+      ? Math.atan2(s.target.y - head.y, s.target.x - head.x)
+      : s.angle;
+
+    // Sample 9 angles spread around current heading + a bias toward desiredAngle
+    const lookDist = 60 + s.radius * 4 + (s.boosting ? 50 : 0);
+    const safetyMargin = 30 + s.caution * 30;
+    const candidateAngles = [
+      s.angle,
+      s.angle + 0.35, s.angle - 0.35,
+      s.angle + 0.7, s.angle - 0.7,
+      s.angle + 1.2, s.angle - 1.2,
+      desiredAngle,
+      desiredAngle + 0.3, desiredAngle - 0.3
+    ];
+
+    let bestAngle = s.angle;
+    let bestScore = -Infinity;
+    for (const a of candidateAngles) {
+      const clear = rayDangerDistance(s, a, lookDist + safetyMargin);
+      // Hard reject if the ray hits something within our safety margin
+      const safe = clear >= safetyMargin;
+      // Prefer angles aligned with desired direction; reward longer clear distance
+      const alignment = -Math.abs(angleDiff(a, desiredAngle));
+      const score = (safe ? 100 : 0) + clear * 0.5 + alignment * 30;
+      if (score > bestScore) { bestScore = score; bestAngle = a; }
+    }
+    s.targetAngle = bestAngle;
+
+    // ====== Boost decisions ======
+    let wantBoost = false;
+    // Boost to close on intercept target if we have plenty of length
+    if (s.target && s.target.kind === 'snake' && s.length > 25) {
+      const td = Math.hypot(s.target.x - head.x, s.target.y - head.y);
+      if (td < 200 && td > 60) wantBoost = Math.random() < s.boostiness * 0.4;
+    }
+    // Burst-boost occasionally for personality
+    if (!wantBoost && s.length > 30 && Math.random() < s.boostiness * 0.003) {
+      wantBoost = true;
+    }
+    // Don't boost into danger
+    if (wantBoost) {
+      const clearAhead = rayDangerDistance(s, s.angle, lookDist + 100);
+      if (clearAhead < 100) wantBoost = false;
+    }
+    s.boosting = wantBoost;
   }
 
   function setupInput() {
@@ -1159,19 +1317,25 @@
       player.boosting = input.boost && player.length > 6;
     }
 
-    // AI runs first, but it queries grids built last frame — that's fine, one-frame lag is invisible
-    for (const s of snakes) {
-      if (!s.isPlayer) updateBotAI(s, dt);
+    // Rebuild grids first so AI feelers query current-frame positions
+    rebuildSegmentGrid();
+    rebuildFoodGrid();
+
+    // Throttle AI: heavy bots (feeler-casting) don't need to think every frame.
+    // Each bot picks a new heading at most every ~3 frames; in between, they keep their last decision.
+    // This cuts AI cost ~3x with no visible difference (turn rate is already gradual).
+    for (let i = 0; i < snakes.length; i++) {
+      const s = snakes[i];
+      if (s.isPlayer || !s.alive) continue;
+      if ((frame + i) % 3 === 0) updateBotAI(s, dt * 3);
     }
 
     for (const s of snakes) updateSnake(s, dt);
 
-    // Rebuild grids now that everything has moved
+    // Rebuild segment grid again after movement so collision check is accurate
     rebuildSegmentGrid();
-    rebuildFoodGrid();
 
     for (const s of snakes) checkFoodCollisions(s);
-    // Food was eaten; rebuild food grid is unnecessary because next collision pass doesn't use it
     for (const s of snakes) checkSnakeCollisions(s);
 
     while (food.length < FOOD_COUNT) food.push(spawnFoodInWorld());
